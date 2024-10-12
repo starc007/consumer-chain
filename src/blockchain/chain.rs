@@ -1,13 +1,12 @@
-use crate::blockchain::Block;
 use crate::blockchain::transaction::Transaction;
+use crate::blockchain::Block;
 use crate::consensus::ConsensusManager;
-use crate::crypto::{Hash, PublicKey,Hashable};
+use crate::crypto::{Hash, Hashable, PublicKey};
 use crate::network::P2PNetwork;
 use crate::state::WorldState;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
-use std::marker::PhantomData;
 use tokio::sync::RwLock;
 
 pub struct Blockchain {
@@ -15,22 +14,14 @@ pub struct Blockchain {
     latest_block_hash: Arc<RwLock<Hash>>,
     world_state: Arc<RwLock<WorldState>>,
     consensus_manager: Arc<RwLock<ConsensusManager>>,
-    network: Arc<RwLock<P2PNetwork>>, // Change this line
-    _phantom: PhantomData<()>,
+    network: Arc<RwLock<Option<Arc<RwLock<P2PNetwork>>>>>,
+    mempool: Arc<RwLock<HashSet<Transaction>>>,
 }
 
 impl Blockchain {
-    pub fn new(
-        consensus_manager: ConsensusManager,
-        network: P2PNetwork,
-    ) -> Self {
+    pub fn new(consensus_manager: ConsensusManager) -> Self {
         let genesis_validator = PublicKey::genesis();
-        let genesis_block = Block::new(
-            Hash::default(),
-            vec![],
-            0,
-            genesis_validator
-        );
+        let genesis_block = Block::new(Hash::default(), vec![], 0, genesis_validator);
         let genesis_hash = genesis_block.hash();
 
         let mut blocks = HashMap::new();
@@ -41,11 +32,20 @@ impl Blockchain {
             latest_block_hash: Arc::new(RwLock::new(genesis_hash)),
             world_state: Arc::new(RwLock::new(WorldState::new())),
             consensus_manager: Arc::new(RwLock::new(consensus_manager)),
-            network: Arc::new(RwLock::new(network)), // Wrap network in RwLock
-            _phantom: PhantomData,
+            network: Arc::new(RwLock::new(None)),
+            mempool: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
+    pub async fn set_network(&mut self, network: Arc<RwLock<P2PNetwork>>) {
+        let mut net = self.network.write().await;
+        *net = Some(network);
+    }
+
+    pub async fn get_network(&self) -> Option<Arc<RwLock<P2PNetwork>>> {
+        let net = self.network.read().await;
+        net.as_ref().cloned()
+    }
     pub async fn add_block(&self, block: Block) -> Result<(), Box<dyn Error>> {
         let mut blocks = self.blocks.write().await;
         let mut latest_block_hash = self.latest_block_hash.write().await;
@@ -75,13 +75,21 @@ impl Blockchain {
             return Err("Invalid transaction signature".into());
         }
 
-        // Add to mempool (not implemented in this example)
-        // Broadcast transaction to network
-        let mut network = self.network.write().await;
-        network.handle_network_message(crate::network::p2p::NetworkMessage::NewTransaction(transaction.clone())).await;
+        // Check if the sender has sufficient balance
+        let sender_balance = self.get_account_balance(&transaction.from).await;
+        if sender_balance < transaction.amount {
+            return Err("Insufficient balance".into());
+        }
 
-        // Optionally, you might want to add the transaction to a local mempool here
-        // self.add_to_mempool(transaction);
+        self.add_to_mempool(transaction.clone()).await?;
+
+        // Broadcast transaction to network
+        if let Some(network) = self.get_network().await {
+            let mut network = network.write().await;
+            network.broadcast_transaction(transaction).await?;
+        } else {
+            return Err("Network not initialized".into());
+        }
 
         Ok(())
     }
@@ -99,6 +107,54 @@ impl Blockchain {
 
     pub async fn get_account_balance(&self, public_key: &PublicKey) -> u64 {
         let world_state = self.world_state.read().await;
-        world_state.get_account(public_key).map_or(0, |account| account.balance)
+        world_state
+            .get_account(public_key)
+            .map_or(0, |account| account.balance)
+    }
+
+    async fn add_to_mempool(&self, transaction: Transaction) -> Result<(), Box<dyn Error>> {
+        let mut mempool = self.mempool.write().await;
+        if mempool.insert(transaction.clone()) {
+            Ok(())
+        } else {
+            Err("Transaction already in mempool".into())
+        }
+    }
+
+    pub async fn mine_block(&mut self) -> Result<Block, Box<dyn Error>> {
+        // Get pending transactions from mempool
+        let transactions = self.get_transactions_from_mempool().await?;
+
+        // Create a new block
+        let previous_hash = self.get_latest_block_hash().await?;
+        let height = self.get_chain_length().await?;
+        let miner_address = self.get_miner_address(); // You need to implement this method
+
+        let new_block = Block::new(previous_hash, transactions, height, miner_address);
+
+        // Add the new block to the chain
+        self.add_block(new_block.clone()).await?;
+
+        Ok(new_block)
+    }
+
+    async fn get_transactions_from_mempool(&self) -> Result<Vec<Transaction>, Box<dyn Error>> {
+        let mempool = self.mempool.read().await;
+        Ok(mempool.iter().cloned().collect())
+    }
+
+    async fn get_latest_block_hash(&self) -> Result<Hash, Box<dyn Error>> {
+        let latest_block_hash = self.latest_block_hash.read().await;
+        Ok(latest_block_hash.clone())
+    }
+
+    async fn get_chain_length(&self) -> Result<u64, Box<dyn Error>> {
+        let blocks = self.blocks.read().await;
+        Ok(blocks.len() as u64)
+    }
+    fn get_miner_address(&self) -> PublicKey {
+        // Implement this method to return the miner's public key
+        // This could be a fixed value or derived from a configuration
+        unimplemented!()
     }
 }

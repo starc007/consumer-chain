@@ -3,13 +3,12 @@ use crate::blockchain::chain::Blockchain;
 use crate::blockchain::transaction::Transaction;
 use crate::crypto::{Hash, Hashable};
 use futures::prelude::*;
+use libp2p::core::either::EitherError;
 use libp2p::{
-    core::upgrade,
     floodsub::{Floodsub, FloodsubEvent, Topic},
     identity,
     mdns::{Mdns, MdnsEvent},
-    mplex, noise,
-    swarm::{NetworkBehaviourEventProcess, SwarmBuilder, SwarmEvent},
+    swarm::{NetworkBehaviourEventProcess, ProtocolsHandlerUpgrErr, SwarmBuilder, SwarmEvent,Swarm},
     tcp::TokioTcpConfig,
     NetworkBehaviour, PeerId, Transport,
 };
@@ -17,8 +16,13 @@ use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use std::io;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
+use void::Void;
+use libp2p::noise::{Keypair, NoiseConfig, X25519Spec};
+use libp2p::core::upgrade::Version;
+use libp2p::mplex::MplexConfig;
 
 const BLOCK_TOPIC: &str = "blocks";
 const TRANSACTION_TOPIC: &str = "transactions";
@@ -73,7 +77,7 @@ pub enum NetworkMessage {
 }
 
 pub struct P2PNetwork {
-    swarm: libp2p::Swarm<FluxBehaviour>,
+    swarm: Swarm<FluxBehaviour>,
     response_receiver: mpsc::UnboundedReceiver<NetworkMessage>,
     blockchain: Arc<RwLock<Blockchain>>,
     pending_block_requests: HashMap<Hash, mpsc::Sender<Block>>,
@@ -81,18 +85,18 @@ pub struct P2PNetwork {
 
 impl P2PNetwork {
     pub async fn new(blockchain: Arc<RwLock<Blockchain>>) -> Result<Self, Box<dyn StdError>> {
-        let id_keys = identity::Keypair::generate_ed25519();
+       let id_keys = identity::Keypair::generate_ed25519();
         let peer_id = PeerId::from(id_keys.public());
         info!("Local peer id: {:?}", peer_id);
 
-        let noise_keys = noise::Keypair::<noise::X25519Spec>::new()
+        let noise_keys = Keypair::<X25519Spec>::new()
             .into_authentic(&id_keys)
             .expect("Signing libp2p-noise static DH keypair failed.");
 
         let transport = TokioTcpConfig::new()
-            .upgrade(upgrade::Version::V1)
-            .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
-            .multiplex(mplex::MplexConfig::new())
+            .upgrade(Version::V1)
+            .authenticate(NoiseConfig::xx(noise_keys).into_authenticated())
+            .multiplex(MplexConfig::new())
             .boxed();
 
         let (response_sender, response_receiver) = mpsc::unbounded_channel();
@@ -109,7 +113,7 @@ impl P2PNetwork {
             .floodsub
             .subscribe(Topic::new(BLOCK_REQUEST_TOPIC));
 
-        let swarm = SwarmBuilder::new(transport, behaviour, peer_id)
+       let swarm = SwarmBuilder::new(transport, behaviour, peer_id)
             .executor(Box::new(|fut| {
                 tokio::spawn(fut);
             }))
@@ -164,19 +168,22 @@ impl P2PNetwork {
         }
     }
 
-    async fn handle_swarm_event(&mut self, event: SwarmEvent<FluxBehaviourEvent, void::Void>) {
+    async fn handle_swarm_event(
+        &mut self,
+        event: SwarmEvent<(), EitherError<ProtocolsHandlerUpgrErr<io::Error>, Void>>,
+    ) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!("Listening on {:?}", address);
             }
-            SwarmEvent::Behaviour(behaviour_event) => match behaviour_event {
-                FluxBehaviourEvent::Floodsub(event) => {
-                    self.floodsub_event(event).await;
-                }
-                FluxBehaviourEvent::Mdns(event) => {
-                    self.mdns_event(event).await;
-                }
-            },
+            // SwarmEvent::Behaviour(behaviour_event) => match behaviour_event {
+            //     FluxBehaviourEvent::Floodsub(event) => {
+            //         self.floodsub_event(event).await;
+            //     }
+            //     FluxBehaviourEvent::Mdns(event) => {
+            //         self.mdns_event(event).await;
+            //     }
+            // },
             _ => {}
         }
     }
@@ -257,7 +264,7 @@ impl P2PNetwork {
         Ok(())
     }
 
-    async fn broadcast_transaction(
+    pub async fn broadcast_transaction(
         &mut self,
         transaction: Transaction,
     ) -> Result<(), Box<dyn std::error::Error>> {

@@ -36,7 +36,7 @@ impl WorldState {
         Ok(())
     }
 
-    fn apply_transaction(&mut self, tx: &Transaction) -> Result<(), String> {
+    pub fn apply_transaction(&mut self, tx: &Transaction) -> Result<(), String> {
         let mut accounts = self.accounts.write().unwrap();
 
         let from_account = accounts.entry(tx.from.clone()).or_insert(Account {

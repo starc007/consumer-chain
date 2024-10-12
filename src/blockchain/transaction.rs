@@ -1,5 +1,6 @@
 use crate::crypto::{Hash, Hashable, PublicKey};
 use serde::{Deserialize, Serialize};
+use std::hash::{Hash as StdHash, Hasher};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
@@ -9,6 +10,26 @@ pub struct Transaction {
     pub nonce: u64,
     pub signature: Vec<u8>,
 }
+
+impl StdHash for Transaction {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.from.hash(state);
+        self.to.hash(state);
+        self.amount.hash(state);
+        self.nonce.hash(state);
+    }
+}
+
+impl PartialEq for Transaction {
+    fn eq(&self, other: &Self) -> bool {
+        self.from == other.from
+            && self.to == other.to
+            && self.amount == other.amount
+            && self.nonce == other.nonce
+    }
+}
+
+impl Eq for Transaction {}
 
 impl Transaction {
     pub fn new(from: PublicKey, to: PublicKey, amount: u64, nonce: u64) -> Self {
